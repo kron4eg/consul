@@ -1,8 +1,9 @@
-package command
+package exec
 
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -13,9 +14,18 @@ import (
 	"time"
 	"unicode"
 
-	consulapi "github.com/hashicorp/consul/api"
+	"github.com/hashicorp/consul/api"
+	"github.com/hashicorp/consul/command/flags"
 	"github.com/mitchellh/cli"
 )
+
+var synopsis = "Executes a command on Consul nodes"
+var usage = `Usage: consul exec [options] [-|command...]
+
+  Evaluates a command on remote Consul nodes. The nodes responding can
+  be filtered using regular expressions on node name, service, and tag
+  definitions. If a command is '-', stdin will be read until EOF
+  and used as a script input. `
 
 const (
 	// rExecPrefix is the prefix in the KV store used to
@@ -117,47 +127,66 @@ type rExecExit struct {
 	Code int
 }
 
-// ExecCommand is a Command implementation that is used to
-// do remote execution of commands
-type ExecCommand struct {
-	BaseCommand
+func New(ui cli.Ui, shutdownCh <-chan struct{}) *cmd {
+	c := &cmd{UI: ui, shutdownCh: shutdownCh}
+	c.initFlags()
+	return c
+}
 
-	ShutdownCh <-chan struct{}
+type cmd struct {
+	UI          cli.Ui
+	flags       *flag.FlagSet
+	clientFlags *flags.HTTPClient
+	serverFlags *flags.HTTPServer
+
+	shutdownCh <-chan struct{}
 	conf       rExecConf
-	client     *consulapi.Client
+	client     *api.Client
 	sessionID  string
 	stopCh     chan struct{}
 }
 
-func (c *ExecCommand) initFlags() {
-	c.InitFlagSet()
-	c.FlagSet.StringVar(&c.conf.node, "node", "",
+func (c *cmd) initFlags() {
+	c.flags = flag.NewFlagSet("", flag.ContinueOnError)
+	c.flags.StringVar(&c.conf.node, "node", "",
 		"Regular expression to filter on node names.")
-	c.FlagSet.StringVar(&c.conf.service, "service", "",
+	c.flags.StringVar(&c.conf.service, "service", "",
 		"Regular expression to filter on service instances.")
-	c.FlagSet.StringVar(&c.conf.tag, "tag", "",
+	c.flags.StringVar(&c.conf.tag, "tag", "",
 		"Regular expression to filter on service tags. Must be used with -service.")
-	c.FlagSet.StringVar(&c.conf.prefix, "prefix", rExecPrefix,
+	c.flags.StringVar(&c.conf.prefix, "prefix", rExecPrefix,
 		"Prefix in the KV store to use for request data.")
-	c.FlagSet.BoolVar(&c.conf.shell, "shell", true,
+	c.flags.BoolVar(&c.conf.shell, "shell", true,
 		"Use a shell to run the command.")
-	c.FlagSet.DurationVar(&c.conf.wait, "wait", rExecQuietWait,
+	c.flags.DurationVar(&c.conf.wait, "wait", rExecQuietWait,
 		"Period to wait with no responses before terminating execution.")
-	c.FlagSet.DurationVar(&c.conf.replWait, "wait-repl", rExecReplicationWait,
-		"Period to wait for replication before firing event. This is an "+
-			"optimization to allow stale reads to be performed.")
-	c.FlagSet.BoolVar(&c.conf.verbose, "verbose", false,
+	c.flags.DurationVar(&c.conf.replWait, "wait-repl", rExecReplicationWait,
+		"Period to wait for replication before firing event. This is an optimization to allow stale reads to be performed.")
+	c.flags.BoolVar(&c.conf.verbose, "verbose", false,
 		"Enables verbose output.")
+
+	c.clientFlags = &flags.HTTPClient{}
+	flags.Merge(c.flags, c.clientFlags.Flags())
+
+	c.serverFlags = &flags.HTTPServer{}
+	flags.Merge(c.flags, c.serverFlags.Flags())
 }
 
-func (c *ExecCommand) Run(args []string) int {
-	c.initFlags()
-	if err := c.FlagSet.Parse(args); err != nil {
+func (c *cmd) Synopsis() string {
+	return synopsis
+}
+
+func (c *cmd) Help() string {
+	return flags.Usage(usage, c.flags, c.clientFlags.Flags(), c.serverFlags.Flags())
+}
+
+func (c *cmd) Run(args []string) int {
+	if err := c.flags.Parse(args); err != nil {
 		return 1
 	}
 
 	// Join the commands to execute
-	c.conf.cmd = strings.Join(c.FlagSet.Args(), " ")
+	c.conf.cmd = strings.Join(c.flags.Args(), " ")
 
 	// If there is no command, read stdin for a script input
 	if c.conf.cmd == "-" {
@@ -178,7 +207,7 @@ func (c *ExecCommand) Run(args []string) int {
 		c.conf.script = buf.Bytes()
 	} else if !c.conf.shell {
 		c.conf.cmd = ""
-		c.conf.args = c.FlagSet.Args()
+		c.conf.args = c.flags.Args()
 	}
 
 	// Ensure we have a command or script
@@ -196,7 +225,7 @@ func (c *ExecCommand) Run(args []string) int {
 	}
 
 	// Create and test the HTTP client
-	client, err := c.HTTPClient()
+	client, err := flags.NewAPIClient(c.clientFlags)
 	if err != nil {
 		c.UI.Error(fmt.Sprintf("Error connecting to Consul agent: %s", err))
 		return 1
@@ -209,7 +238,7 @@ func (c *ExecCommand) Run(args []string) int {
 	c.client = client
 
 	// Check if this is a foreign datacenter
-	if c.HTTPDatacenter() != "" && c.HTTPDatacenter() != info["Config"]["Datacenter"] {
+	if c.serverFlags.Datacenter.String() != "" && c.serverFlags.Datacenter.String() != info["Config"]["Datacenter"] {
 		if c.conf.verbose {
 			c.UI.Info("Remote exec in foreign datacenter, using Session TTL")
 		}
@@ -252,7 +281,7 @@ func (c *ExecCommand) Run(args []string) int {
 	// largely this is a heuristic.
 	select {
 	case <-time.After(c.conf.replWait):
-	case <-c.ShutdownCh:
+	case <-c.shutdownCh:
 		return 1
 	}
 
@@ -271,7 +300,7 @@ func (c *ExecCommand) Run(args []string) int {
 }
 
 // waitForJob is used to poll for results and wait until the job is terminated
-func (c *ExecCommand) waitForJob() int {
+func (c *cmd) waitForJob() int {
 	// Although the session destroy is already deferred, we do it again here,
 	// because invalidation of the session before destroyData() ensures there is
 	// no race condition allowing an agent to upload data (the acquire will fail).
@@ -337,7 +366,7 @@ OUTER:
 		case <-errCh:
 			return 1
 
-		case <-c.ShutdownCh:
+		case <-c.shutdownCh:
 			return 1
 		}
 	}
@@ -350,10 +379,10 @@ OUTER:
 
 // streamResults is used to perform blocking queries against the KV endpoint and stream in
 // notice of various events into waitForJob
-func (c *ExecCommand) streamResults(doneCh chan struct{}, ackCh chan rExecAck, heartCh chan rExecHeart,
+func (c *cmd) streamResults(doneCh chan struct{}, ackCh chan rExecAck, heartCh chan rExecHeart,
 	outputCh chan rExecOutput, exitCh chan rExecExit, errCh chan struct{}) {
 	kv := c.client.KV()
-	opts := consulapi.QueryOptions{WaitTime: c.conf.wait}
+	opts := api.QueryOptions{WaitTime: c.conf.wait}
 	dir := path.Join(c.conf.prefix, c.sessionID) + "/"
 	seen := make(map[string]struct{})
 
@@ -465,7 +494,7 @@ func (conf *rExecConf) validate() error {
 }
 
 // createSession is used to create a new session for this command
-func (c *ExecCommand) createSession() (string, error) {
+func (c *cmd) createSession() (string, error) {
 	var id string
 	var err error
 	if c.conf.foreignDC {
@@ -482,11 +511,11 @@ func (c *ExecCommand) createSession() (string, error) {
 
 // createSessionLocal is used to create a new session in a local datacenter
 // This is simpler since we can use the local agent to create the session.
-func (c *ExecCommand) createSessionLocal() (string, error) {
+func (c *cmd) createSessionLocal() (string, error) {
 	session := c.client.Session()
-	se := consulapi.SessionEntry{
+	se := api.SessionEntry{
 		Name:     "Remote Exec",
-		Behavior: consulapi.SessionBehaviorDelete,
+		Behavior: api.SessionBehaviorDelete,
 		TTL:      rExecTTL,
 	}
 	id, _, err := session.Create(&se, nil)
@@ -496,7 +525,7 @@ func (c *ExecCommand) createSessionLocal() (string, error) {
 // createSessionLocal is used to create a new session in a foreign datacenter
 // This is more complex since the local agent cannot be used to create
 // a session, and we must associate with a node in the remote datacenter.
-func (c *ExecCommand) createSessionForeign() (string, error) {
+func (c *cmd) createSessionForeign() (string, error) {
 	// Look for a remote node to bind to
 	health := c.client.Health()
 	services, _, err := health.Service("consul", "", true, nil)
@@ -508,16 +537,15 @@ func (c *ExecCommand) createSessionForeign() (string, error) {
 	}
 	node := services[0].Node.Node
 	if c.conf.verbose {
-		c.UI.Info(fmt.Sprintf("Binding session to remote node %s@%s",
-			node, c.HTTPDatacenter()))
+		c.UI.Info(fmt.Sprintf("Binding session to remote node %s@%s", node, c.serverFlags.Datacenter.String()))
 	}
 
 	session := c.client.Session()
-	se := consulapi.SessionEntry{
+	se := api.SessionEntry{
 		Name:     fmt.Sprintf("Remote Exec via %s@%s", c.conf.localNode, c.conf.localDC),
 		Node:     node,
 		Checks:   []string{},
-		Behavior: consulapi.SessionBehaviorDelete,
+		Behavior: api.SessionBehaviorDelete,
 		TTL:      rExecTTL,
 	}
 	id, _, err := session.CreateNoChecks(&se, nil)
@@ -527,7 +555,7 @@ func (c *ExecCommand) createSessionForeign() (string, error) {
 // renewSession is a long running routine that periodically renews
 // the session TTL. This is used for foreign sessions where we depend
 // on TTLs.
-func (c *ExecCommand) renewSession(id string, stopCh chan struct{}) {
+func (c *cmd) renewSession(id string, stopCh chan struct{}) {
 	session := c.client.Session()
 	for {
 		select {
@@ -544,7 +572,7 @@ func (c *ExecCommand) renewSession(id string, stopCh chan struct{}) {
 }
 
 // destroySession is used to destroy the associated session
-func (c *ExecCommand) destroySession() error {
+func (c *cmd) destroySession() error {
 	// Stop the session renew if any
 	if c.stopCh != nil {
 		close(c.stopCh)
@@ -560,7 +588,7 @@ func (c *ExecCommand) destroySession() error {
 // makeRExecSpec creates a serialized job specification
 // that can be uploaded which will be parsed by agents to
 // determine what to do.
-func (c *ExecCommand) makeRExecSpec() ([]byte, error) {
+func (c *cmd) makeRExecSpec() ([]byte, error) {
 	spec := &rExecSpec{
 		Command: c.conf.cmd,
 		Args:    c.conf.args,
@@ -571,9 +599,9 @@ func (c *ExecCommand) makeRExecSpec() ([]byte, error) {
 }
 
 // uploadPayload is used to upload the request payload
-func (c *ExecCommand) uploadPayload(payload []byte) error {
+func (c *cmd) uploadPayload(payload []byte) error {
 	kv := c.client.KV()
-	pair := consulapi.KVPair{
+	pair := api.KVPair{
 		Key:     path.Join(c.conf.prefix, c.sessionID, rExecFileName),
 		Value:   payload,
 		Session: c.sessionID,
@@ -591,7 +619,7 @@ func (c *ExecCommand) uploadPayload(payload []byte) error {
 // destroyData is used to nuke all the data associated with
 // this remote exec. We just do a recursive delete of our
 // data directory.
-func (c *ExecCommand) destroyData() error {
+func (c *cmd) destroyData() error {
 	kv := c.client.KV()
 	dir := path.Join(c.conf.prefix, c.sessionID)
 	_, err := kv.DeleteTree(dir, nil)
@@ -600,7 +628,7 @@ func (c *ExecCommand) destroyData() error {
 
 // fireEvent is used to fire the event that will notify nodes
 // about the remote execution. Returns the event ID or error
-func (c *ExecCommand) fireEvent() (string, error) {
+func (c *cmd) fireEvent() (string, error) {
 	// Create the user event payload
 	msg := &rExecEvent{
 		Prefix:  c.conf.prefix,
@@ -613,7 +641,7 @@ func (c *ExecCommand) fireEvent() (string, error) {
 
 	// Format the user event
 	event := c.client.Event()
-	params := &consulapi.UserEvent{
+	params := &api.UserEvent{
 		Name:          "_rexec",
 		Payload:       buf,
 		NodeFilter:    c.conf.node,
@@ -624,23 +652,6 @@ func (c *ExecCommand) fireEvent() (string, error) {
 	// Fire the event
 	id, _, err := event.Fire(params, nil)
 	return id, err
-}
-
-func (c *ExecCommand) Synopsis() string {
-	return "Executes a command on Consul nodes"
-}
-
-func (c *ExecCommand) Help() string {
-	c.initFlags()
-	return c.HelpCommand(`
-Usage: consul exec [options] [-|command...]
-
-  Evaluates a command on remote Consul nodes. The nodes responding can
-  be filtered using regular expressions on node name, service, and tag
-  definitions. If a command is '-', stdin will be read until EOF
-  and used as a script input.
-
-`)
 }
 
 // TargetedUI is a UI that wraps another UI implementation and modifies
