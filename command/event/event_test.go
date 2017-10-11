@@ -1,4 +1,4 @@
-package command
+package event
 
 import (
 	"strings"
@@ -8,26 +8,16 @@ import (
 	"github.com/mitchellh/cli"
 )
 
-func TestEventCommand_implements(t *testing.T) {
-	t.Parallel()
-	var _ cli.Command = &EventCommand{}
-}
-
 func TestEventCommandRun(t *testing.T) {
 	t.Parallel()
 	a1 := agent.NewTestAgent(t.Name(), ``)
 	defer a1.Shutdown()
 
 	ui := cli.NewMockUi()
-	c := &EventCommand{
-		BaseCommand: BaseCommand{
-			UI:    ui,
-			Flags: FlagSetClientHTTP,
-		},
-	}
+	cmd := New(ui)
 	args := []string{"-http-addr=" + a1.HTTPAddr(), "-name=cmd"}
 
-	code := c.Run(args)
+	code := cmd.Run(args)
 	if code != 0 {
 		t.Fatalf("bad: %d. %#v", code, ui.ErrorWriter.String())
 	}
